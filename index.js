@@ -30,7 +30,7 @@ var truthy = function () {
 var createServer = function (e, opts) {
   var server = http.createServer()
   var index = opts.index
-  var getType = opts.type || mime.lookup.bind(mime)
+  var getType = opts.type || mime.getType.bind(mime)
   var filter = opts.filter || truthy
 
   var onready = function () {
@@ -153,7 +153,7 @@ var createServer = function (e, opts) {
     response.setHeader('Accept-Ranges', 'bytes')
     response.setHeader('Content-Type', getType(file.name))
     response.setHeader('transferMode.dlna.org', 'Streaming')
-    response.setHeader('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=017000 00000000000000000000000000')
+    response.setHeader('contentFeatures.dlna.org', 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000')
     if (!range) {
       response.setHeader('Content-Length', file.length)
       if (request.method === 'HEAD') return response.end()

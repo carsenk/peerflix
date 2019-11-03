@@ -12,6 +12,7 @@ var keypress = require('keypress')
 var openUrl = require('open')
 var inquirer = require('inquirer')
 var parsetorrent = require('parse-torrent')
+var bufferFrom = require('buffer-from')
 
 var path = require('path')
 
@@ -81,7 +82,7 @@ var enc = function (s) {
 }
 
 if (argv.t) {
-  VLC_ARGS += ' --sub-file=' + (process.platform === 'win32') ? argv.t : enc(argv.t)
+  VLC_ARGS += ' --sub-file=' + (process.platform === 'win32' ? argv.t : enc(argv.t))
   OMX_EXEC += ' --subtitles ' + enc(argv.t)
   MPLAYER_EXEC += ' -sub ' + enc(argv.t)
   SMPLAYER_EXEC += ' -sub ' + enc(argv.t)
@@ -102,6 +103,28 @@ if (argv._.length > 1) {
   POTPLAYER_ARGS += ' ' + playerArgs
 }
 
+var watchVerifying = function (engine) {
+  var showVerifying = function (i) {
+    var percentage = Math.round(((i + 1) / engine.torrent.pieces.length) * 100.0)
+    clivas.clear()
+    clivas.line('{yellow:Verifying downloaded:} ' + percentage + '%')
+  }
+
+  var startShowVerifying = function () {
+    showVerifying(-1)
+    engine.on('verify', showVerifying)
+  }
+
+  var stopShowVerifying = function () {
+    clivas.clear()
+    engine.removeListener('verify', showVerifying)
+    engine.removeListener('verifying', startShowVerifying)
+  }
+
+  engine.on('verifying', startShowVerifying)
+  engine.on('ready', stopShowVerifying)
+}
+
 var ontorrent = function (torrent) {
   if (argv['peer-port']) argv.peerPort = Number(argv['peer-port'])
 
@@ -109,9 +132,12 @@ var ontorrent = function (torrent) {
   var hotswaps = 0
   var verified = 0
   var invalid = 0
+  var airplayServer = null
+  var downloadedPercentage = 0
 
   engine.on('verify', function () {
     verified++
+    downloadedPercentage = Math.floor(verified / engine.torrent.pieces.length * 100)
   })
 
   engine.on('invalid-piece', function () {
@@ -127,19 +153,24 @@ var ontorrent = function (torrent) {
 
     var onready = function () {
       if (interactive) {
+        var filenamesInOriginalOrder = engine.files.map(file => file.path)
         inquirer.prompt([{
           type: 'list',
           name: 'file',
           message: 'Choose one file',
-          choices: engine.files.map(function (file, i) {
-            return {
-              name: file.name + ' : ' + bytes(file.length),
-              value: i
-          } })}], function (answers) {
-            argv.index = answers.file
-            delete argv.list
-            ontorrent(torrent)
-          })
+          choices: Array.from(engine.files)
+            .sort((file1, file2) => file1.path.localeCompare(file2.path))
+            .map(function (file, i) {
+              return {
+                name: file.name + ' : ' + bytes(file.length),
+                value: filenamesInOriginalOrder.indexOf(file.path)
+              }
+            })
+        }]).then(function (answers) {
+          argv.index = answers.file
+          delete argv.list
+          ontorrent(torrent)
+        })
       } else {
         engine.files.forEach(function (file, i, files) {
           clivas.line('{3+bold:' + i + '} : {magenta:' + file.name + '} : {blue:' + bytes(file.length) + '}')
@@ -147,8 +178,12 @@ var ontorrent = function (torrent) {
         process.exit(0)
       }
     }
+
     if (engine.torrent) onready()
-    else engine.on('ready', onready)
+    else {
+      watchVerifying(engine)
+      engine.on('ready', onready)
+    }
     return
   }
 
@@ -188,6 +223,8 @@ var ontorrent = function (torrent) {
     var timePaused = 0
     var pausedAt = null
 
+    VLC_ARGS += ' --meta-title="' + filename.replace(/"/g, '\\"') + '"'
+
     if (argv.all) {
       filename = engine.torrent.name
       filelength = engine.torrent.length
@@ -195,57 +232,53 @@ var ontorrent = function (torrent) {
       localHref += '.m3u'
     }
 
-    var registry, key
+    var registry = function (hive, key, name, cb) {
+      var Registry = require('winreg')
+      var regKey = new Registry({
+        hive: Registry[hive],
+        key: key
+      })
+      regKey.get(name, cb)
+    }
+
     if (argv.vlc && process.platform === 'win32') {
       player = 'vlc'
-      registry = require('windows-no-runnable').registry
-      if (process.arch === 'x64') {
-        try {
-          key = registry('HKLM/Software/Wow6432Node/VideoLAN/VLC')
-          if (!key['InstallDir']) {
-            throw new Error('no install dir')
-          }
-        } catch (e) {
-          try {
-            key = registry('HKLM/Software/VideoLAN/VLC')
-          } catch (err) {}
-        }
-      } else {
-        try {
-          key = registry('HKLM/Software/VideoLAN/VLC')
-        } catch (err) {
-          try {
-            key = registry('HKLM/Software/Wow6432Node/VideoLAN/VLC')
-          } catch (e) {}
-        }
-      }
-
-      if (key) {
-        var vlcPath = key['InstallDir'].value + path.sep + 'vlc'
+      var runVLC = function (regItem) {
         VLC_ARGS = VLC_ARGS.split(' ')
         VLC_ARGS.unshift(localHref)
-        proc.execFile(vlcPath, VLC_ARGS)
+        proc.execFile(regItem.value + path.sep + 'vlc.exe', VLC_ARGS)
       }
+      registry('HKLM', '\\Software\\VideoLAN\\VLC', 'InstallDir', function (err, regItem) {
+        if (err) {
+          registry('HKLM', '\\Software\\WOW6432Node\\VideoLAN\\VLC', 'InstallDir', function (err, regItem) {
+            if (err) return
+            runVLC(regItem)
+          })
+        } else {
+          runVLC(regItem)
+        }
+      })
     } else if (argv.mpchc && process.platform === 'win32') {
       player = 'mph-hc'
-      registry = require('windows-no-runnable').registry
-      key = registry('HKCU/Software/MPC-HC/MPC-HC')
-
-      var exePath = key['ExePath']
-      proc.exec('"' + exePath + '" "' + localHref + '" ' + MPC_HC_ARGS)
+      registry('HKCU', '\\Software\\MPC-HC\\MPC-HC', 'ExePath', function (err, regItem) {
+        if (err) return
+        proc.exec('"' + regItem.value + '" "' + localHref + '" ' + MPC_HC_ARGS)
+      })
     } else if (argv.potplayer && process.platform === 'win32') {
       player = 'potplayer'
-      registry = require('windows-no-runnable').registry
-      if (process.arch === 'x64')
-        key = registry('HKCU/Software/DAUM/PotPlayer64')
-
-      if (!key || !key['ProgramPath'])
-        key = registry('HKCU/Software/DAUM/PotPlayer')
-
-      if (key['ProgramPath']) {
-        var potplayerPath = key['ProgramPath'].value
-        proc.exec('"' + potplayerPath + '" "' + localHref + '" ' + POTPLAYER_ARGS)
+      var runPotPlayer = function (regItem) {
+        proc.exec('"' + regItem.value + '" "' + localHref + '" ' + POTPLAYER_ARGS)
       }
+      registry('HKCU', '\\Software\\DAUM\\PotPlayer64', 'ProgramPath', function (err, regItem) {
+        if (err) {
+          registry('HKCU', '\\Software\\DAUM\\PotPlayer', 'ProgramPath', function (err, regItem) {
+            if (err) return
+            runPotPlayer(regItem)
+          })
+        } else {
+          runPotPlayer(regItem)
+        }
+      })
     } else {
       if (argv.vlc) {
         player = 'vlc'
@@ -298,6 +331,7 @@ var ontorrent = function (torrent) {
     if (argv.airplay) {
       var list = require('airplayer')()
       list.once('update', function (player) {
+        airplayServer = player
         list.destroy()
         player.play(href)
       })
@@ -307,7 +341,7 @@ var ontorrent = function (torrent) {
 
     if (argv.quiet) return console.log('server is listening on ' + href)
 
-    process.stdout.write(new Buffer('G1tIG1sySg==', 'base64')) // clear for drawing
+    process.stdout.write(bufferFrom('G1tIG1sySg==', 'base64')) // clear for drawing
 
     var interactive = !player && process.stdin.isTTY && !!process.stdin.setRawMode
 
@@ -366,12 +400,16 @@ var ontorrent = function (torrent) {
       var peerslisted = 0
 
       clivas.clear()
-      if (argv.airplay) clivas.line('{green:streaming to} {bold:apple-tv} {green:using airplay}')
-      else clivas.line('{green:open} {bold:' + (player || 'vlc') + '} {green:and enter} {bold:' + href + '} {green:as the network address}')
+      if (argv.airplay) {
+        if (airplayServer) clivas.line('{green:streaming to} {bold:' + airplayServer.name + '} {green:using airplay}')
+        else clivas.line('{green:streaming} {green:using airplay}')
+      } else {
+        clivas.line('{green:open} {bold:' + (player || 'vlc') + '} {green:and enter} {bold:' + href + '} {green:as the network address}')
+      }
       clivas.line('')
       clivas.line('{yellow:info} {green:streaming} {bold:' + filename + ' (' + bytes(filelength) + ')} {green:-} {bold:' + bytes(swarm.downloadSpeed()) + '/s} {green:from} {bold:' + unchoked.length + '/' + wires.length + '} {green:peers}    ')
       clivas.line('{yellow:info} {green:path} {cyan:' + engine.path + '}')
-      clivas.line('{yellow:info} {green:downloaded} {bold:' + bytes(swarm.downloaded) + '} {green:and uploaded }{bold:' + bytes(swarm.uploaded) + '} {green:in }{bold:' + runtime + 's} {green:with} {bold:' + hotswaps + '} {green:hotswaps}     ')
+      clivas.line('{yellow:info} {green:downloaded} {bold:' + bytes(swarm.downloaded) + '} (' + downloadedPercentage + '%) {green:and uploaded }{bold:' + bytes(swarm.uploaded) + '} {green:in }{bold:' + runtime + 's} {green:with} {bold:' + hotswaps + '} {green:hotswaps}     ')
       clivas.line('{yellow:info} {green:verified} {bold:' + verified + '} {green:pieces and received} {bold:' + invalid + '} {green:invalid pieces}')
       clivas.line('{yellow:info} {green:peer queue size is} {bold:' + swarm.queued + '}')
       clivas.line('{80:}')
@@ -435,6 +473,8 @@ var ontorrent = function (torrent) {
     clivas.line('')
     clivas.line('{yellow:info} {green:peerflix is exiting...}')
   }
+
+  watchVerifying(engine)
 
   if (argv.remove) {
     var remove = function () {
